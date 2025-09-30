@@ -1,9 +1,12 @@
 #include "bumperbot_motion/pd_motion_planner.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include <algorithm>
 
 namespace bumperbot_motion {
     PDMotionPlanner::PDMotionPlanner() : Node("pd_motion_planner_node"), 
-    kp_(2.0), kd_(0.1), step_size_(0.2), max_linear_velocity_(0.3), max_angular_velocity_(1.0) {
+    kp_(2.0), kd_(0.1), step_size_(0.2), max_linear_velocity_(0.3), max_angular_velocity_(1.0),
+    prev_linear_error_(0.0), prev_angular_error_(0.0) {
         declare_parameter<double>("kp", kp_);
         declare_parameter<double>("kd", kd_);
         declare_parameter<double>("step_size", step_size_);
@@ -25,6 +28,7 @@ namespace bumperbot_motion {
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
         control_loop_ = create_wall_timer(std::chrono::milliseconds(100), std::bind(&PDMotionPlanner::controlLoop, this));
+        last_cycle_time_ = get_clock()->now();
     }
 
     void PDMotionPlanner::pathCallback(const nav_msgs::msg::Path::SharedPtr path) {
@@ -45,9 +49,51 @@ namespace bumperbot_motion {
             RCLCPP_WARN(get_logger(), "Could not transform : %s", error.what());
             return;
         }
+
+        if(!transformPlan(robot_pose.header.frame_id)) {
+            RCLCPP_ERROR(get_logger(), "Unable to transform Plan in robot's frame");
+            return;
+        }
+
+        geometry_msgs::msg::PoseStamped robot_pose_stamped;
+        robot_pose_stamped.header.frame_id = robot_pose.header.frame_id;
+        robot_pose_stamped.pose.position.x = robot_pose.transform.translation.x;
+        robot_pose_stamped.pose.position.y = robot_pose.transform.translation.y;
+        robot_pose_stamped.pose.orientation = robot_pose.transform.rotation;
+
+        auto next_pose = getNextPose(robot_pose_stamped);
+        double dx = next_pose.pose.position.x - robot_pose_stamped.pose.position.x;
+        double dy = next_pose.pose.position.y - robot_pose_stamped.pose.position.y;
+        double distance = std::sqrt(dx * dx + dy * dy);
+
+        if(distance <= 0.1) {
+            RCLCPP_INFO(get_logger(), "Goal Reached!");
+            global_plan_.poses.clear();
+            return;
+        }
+
+        next_pose_pub_->publish(next_pose);
+        tf2::Transform robot_tf, next_pose_tf, next_pose_robot_tf;
+        tf2::fromMsg(robot_pose_stamped.pose, robot_tf);
+        tf2::fromMsg(next_pose.pose, next_pose_tf);
+
+        next_pose_robot_tf = robot_tf.inverse() * next_pose_tf;
+        double linear_error = next_pose_robot_tf.getOrigin().getX();
+        double angular_error = next_pose_robot_tf.getOrigin().getY();
+
+        double dt = (get_clock()->now() - last_cycle_time_).seconds();
+        double linear_error_derivative = (linear_error - prev_linear_error_) / dt;
+        double angular_error_derivative = (angular_error - prev_angular_error_) / dt;
+
+        geometry_msgs::msg::Twist cmd_vel;
+        cmd_vel.linear.x = std::clamp(kp_ * linear_error + kd_ * linear_error_derivative, -max_linear_velocity_, max_linear_velocity_);
+        cmd_vel.angular.z = std::clamp(kp_ * angular_error + kd_ * angular_error_derivative, -max_angular_velocity_, max_angular_velocity_);
         
-        RCLCPP_INFO(get_logger(), "frame_id Robot Pose: %s", robot_pose.header.frame_id.c_str());
-        RCLCPP_INFO(get_logger(), "frame_id Global Plan: %s", global_plan_.header.frame_id.c_str());
+        cmd_pub_->publish(cmd_vel);
+
+        last_cycle_time_ = get_clock()->now();
+        prev_linear_error_ = linear_error;
+        prev_angular_error_ = angular_error;
     }
 
     bool PDMotionPlanner::transformPlan(const std::string &frame) {
@@ -55,8 +101,48 @@ namespace bumperbot_motion {
             return true;
         }
 
-        
+        geometry_msgs::msg::TransformStamped transform;
+        try {
+            transform = tf_buffer_->lookupTransform(frame, global_plan_.header.frame_id, tf2::TimePointZero);
+        }
+
+        catch(tf2::LookupException &error) {
+            RCLCPP_ERROR_STREAM(get_logger(), "Couldn't transform plan from frame " << global_plan_.header.frame_id << " to " << frame);
+            return false;
+        }
+
+        for(auto &pose : global_plan_.poses) {
+            tf2::doTransform(pose, pose, transform);
+        }
+
+        global_plan_.header.frame_id = frame;
+        return true;
     }
+
+     geometry_msgs::msg::PoseStamped PDMotionPlanner::getNextPose(const geometry_msgs::msg::PoseStamped &robot_pose) {
+        auto next_pose = global_plan_.poses.back();
+        
+        // iterates in reverse order, starting from last to first pose
+        for(auto pose_it = global_plan_.poses.rbegin(); pose_it != global_plan_.poses.rend(); ++pose_it) {
+            // calculate distance between pose_it and robot_pose
+            double dx = pose_it->pose.position.x - robot_pose.pose.position.x;
+            double dy = pose_it->pose.position.y - robot_pose.pose.position.y;
+            
+            // using eudcian distance
+            double distance = std::sqrt(dx * dx + dy * dy);
+
+            if(distance > step_size_) {
+                next_pose = *pose_it;
+            }
+
+            else {
+                break;
+            }
+        }
+
+        return next_pose;
+    }
+
 }
 
 int main(int argc, char **argv) {

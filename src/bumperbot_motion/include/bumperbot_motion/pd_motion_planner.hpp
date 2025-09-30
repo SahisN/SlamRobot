@@ -42,8 +42,18 @@ namespace bumperbot_motion {
 
             nav_msgs::msg::Path global_plan_;
 
+            // saves previous linear overshoot
+            double prev_linear_error_;
+
+            // saves previous angular overshoot
+            double prev_angular_error_;
+
+            // saves the previous cycle time for control loop function
+            rclcpp::Time last_cycle_time_;
+
             void controlLoop();
             void pathCallback(const nav_msgs::msg::Path::SharedPtr path);
             bool transformPlan(const std::string &frame);
+            geometry_msgs::msg::PoseStamped getNextPose(const geometry_msgs::msg::PoseStamped &robot_pose);
     };
 }
